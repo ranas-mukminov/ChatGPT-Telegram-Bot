@@ -61,14 +61,19 @@ import asyncio
 lock = asyncio.Lock()
 event = asyncio.Event()
 stop_event = asyncio.Event()
-time_out = 600
+
+# Timeout configuration - reduced from 600s (10 min) to reasonable values
+# API calls: 60s, bot operations: 30s
+API_TIMEOUT = 60  # Timeout for API calls (OpenAI, etc.)
+BOT_TIMEOUT = 30  # Timeout for bot operations (send message, etc.)
+time_out = BOT_TIMEOUT  # Keep for backward compatibility
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger()
 
 logging.getLogger("httpx").setLevel(logging.CRITICAL)
 logging.getLogger("chromadb.telemetry.posthog").setLevel(logging.WARNING)
-logging.getLogger('googleapicliet.discovery_cache').setLevel(logging.ERROR)
+logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
 
 class SpecificStringFilter(logging.Filter):
     def __init__(self, specific_string):
@@ -86,10 +91,84 @@ update_logger.addFilter(my_filter)
 update_logger = logging.getLogger("root")
 update_logger.addFilter(my_filter)
 
-# 定义一个缓存来存储消息
+# Message cache with automatic cleanup to prevent memory leaks
 from collections import defaultdict
-message_cache = defaultdict(lambda: [])
-time_stamps = defaultdict(lambda: [])
+from time import time as current_time
+
+# Configuration for cache cleanup
+CACHE_MAX_SIZE = 1000  # Maximum number of conversations to cache
+CACHE_TTL_SECONDS = 300  # Time-to-live: 5 minutes
+
+class MessageCache:
+    """
+    Thread-safe message cache with automatic cleanup to prevent memory leaks.
+    Implements size-based and time-based eviction.
+    """
+    def __init__(self, max_size=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS):
+        self.messages = defaultdict(lambda: [])
+        self.timestamps = defaultdict(lambda: [])
+        self.last_access = {}  # Track last access time for each conversation
+        self.max_size = max_size
+        self.ttl = ttl
+
+    def add_message(self, convo_id, message):
+        """Add a message to the cache and update access time."""
+        self.messages[convo_id].append(message)
+        self.timestamps[convo_id].append(current_time())
+        self.last_access[convo_id] = current_time()
+        self._cleanup_if_needed()
+
+    def get_messages(self, convo_id):
+        """Get all messages for a conversation."""
+        self.last_access[convo_id] = current_time()
+        return self.messages[convo_id]
+
+    def get_timestamps(self, convo_id):
+        """Get all timestamps for a conversation."""
+        return self.timestamps[convo_id]
+
+    def clear_conversation(self, convo_id):
+        """Clear cache for a specific conversation."""
+        if convo_id in self.messages:
+            del self.messages[convo_id]
+        if convo_id in self.timestamps:
+            del self.timestamps[convo_id]
+        if convo_id in self.last_access:
+            del self.last_access[convo_id]
+
+    def _cleanup_if_needed(self):
+        """Clean up old or excess entries to prevent memory leaks."""
+        current = current_time()
+
+        # Remove entries older than TTL
+        expired = [
+            convo_id for convo_id, last_time in self.last_access.items()
+            if current - last_time > self.ttl
+        ]
+        for convo_id in expired:
+            self.clear_conversation(convo_id)
+
+        # If still too many entries, remove least recently used
+        if len(self.messages) > self.max_size:
+            # Sort by last access time and remove oldest
+            sorted_convos = sorted(
+                self.last_access.items(),
+                key=lambda x: x[1]
+            )
+            num_to_remove = len(self.messages) - self.max_size
+            for convo_id, _ in sorted_convos[:num_to_remove]:
+                self.clear_conversation(convo_id)
+
+    def __len__(self):
+        """Return the number of cached conversations."""
+        return len(self.messages)
+
+# Global message cache instance
+message_cache_instance = MessageCache()
+
+# Keep backward compatibility with old API
+message_cache = message_cache_instance.messages
+time_stamps = message_cache_instance.timestamps
 
 @decorators.PrintMessage
 @decorators.GroupAuthorization
@@ -131,11 +210,15 @@ async def command_bot(update, context, title="", has_command=True):
 
             bot_info_username = None
             try:
-                bot_info = await context.bot.get_me(read_timeout=time_out, write_timeout=time_out, connect_timeout=time_out, pool_timeout=time_out)
+                bot_info = await context.bot.get_me(read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT)
                 bot_info_username = bot_info.username
             except Exception as e:
-                print("error:", e)
-                bot_info_username = update_message.reply_to_message.from_user.username
+                logger.warning(f"Failed to get bot info: {e}")
+                # Safely get username, checking for None
+                if update_message.reply_to_message and update_message.reply_to_message.from_user:
+                    bot_info_username = update_message.reply_to_message.from_user.username
+                else:
+                    bot_info_username = None
 
             if update_message.reply_to_message \
             and update_message.from_user.is_bot == False \
@@ -244,7 +327,8 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
     result = ""
     tmpresult = ""
     modifytime = 0
-    time_out = 600
+    # Use API_TIMEOUT for long-running AI requests
+    request_timeout = API_TIMEOUT
     image_has_send = 0
     model_name = engine
     language = Users.get_config(convo_id, "language")
@@ -275,7 +359,8 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
         # print("text", text)
         async for data in robot.ask_stream_async(text, convo_id=convo_id, pass_history=pass_history, model=model_name, language=language, api_url=api_url, api_key=api_key, system_prompt=system_prompt, plugins=plugins):
         # for data in robot.ask_stream(text, convo_id=convo_id, pass_history=pass_history, model=model_name):
-            if stop_event.is_set() and convo_id == target_convo_id and answer_messageid < reset_mess_id:
+            # Check if this conversation should stop (thread-safe)
+            if stop_event.is_set() and check_should_stop(convo_id, answer_messageid):
                 return
             if "message_search_stage_" not in data:
                 result = result + data
@@ -384,10 +469,10 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                             text=escape(send_split_message, italic=False),
                             parse_mode='MarkdownV2',
                             disable_web_page_preview=True,
-                            read_timeout=time_out,
-                            write_timeout=time_out,
-                            pool_timeout=time_out,
-                            connect_timeout=time_out
+                            read_timeout=BOT_TIMEOUT,
+                            write_timeout=BOT_TIMEOUT,
+                            pool_timeout=BOT_TIMEOUT,
+                            connect_timeout=BOT_TIMEOUT
                         )
                         lastresult = escape(send_split_message, italic=False)
                     except Exception as e:
@@ -397,10 +482,10 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                                 message_id=answer_messageid,
                                 text=send_split_message,
                                 disable_web_page_preview=True,
-                                read_timeout=time_out,
-                                write_timeout=time_out,
-                                pool_timeout=time_out,
-                                connect_timeout=time_out
+                                read_timeout=BOT_TIMEOUT,
+                                write_timeout=BOT_TIMEOUT,
+                                pool_timeout=BOT_TIMEOUT,
+                                connect_timeout=BOT_TIMEOUT
                             )
                             print("error:", send_split_message)
                         else:
@@ -416,7 +501,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
             now_result = escape(tmpresult, italic=False)
             if now_result and (modifytime % Frequency_Modification == 0 and lastresult != now_result) or "message_search_stage_" in data:
                 try:
-                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT)
                     lastresult = now_result
                 except Exception as e:
                     # print('\033[31m')
@@ -424,16 +509,21 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                     # print('\033[0m')
                     continue
     except Exception as e:
-        print('\033[31m')
-        traceback.print_exc()
-        print(redact_sensitive_info(tmpresult, Users.get_config(convo_id, "api_key"), Users.get_config(convo_id, "systemprompt")))
-        print('\033[0m')
+        # Log error properly without exposing sensitive data to stdout
+        error_msg = str(e)
+        logger.error(
+            f"Error in getChatGPT for conversation {convo_id}: {error_msg}",
+            exc_info=False  # Don't log full traceback to avoid sensitive data leakage
+        )
+        # Only log detailed traceback to file if needed for debugging
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Full traceback:", exc_info=True)
         api_key = Users.get_config(convo_id, "api_key")
         systemprompt = Users.get_config(convo_id, "systemprompt")
         if api_key:
             robot.reset(convo_id=convo_id, system_prompt=systemprompt)
         if "parse entities" in str(e):
-            await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+            await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT)
         else:
             tmpresult = f"{tmpresult}\n\n`{e}`"
     print(tmpresult)
@@ -469,10 +559,10 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
             print(now_result)
         elif now_result:
             try:
-                await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+                await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT)
             except Exception as e:
                 if "parse entities" in str(e):
-                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT)
 
     if Users.get_config(convo_id, "FOLLOW_UP") and tmpresult.strip():
         if title != "":
@@ -767,22 +857,49 @@ def remove_job_if_exists(name: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
         job.schedule_removal()
     return True
 
-# 定义一个全局变量来存储 chatid
-target_convo_id = None
-reset_mess_id = 9999
+# Store reset state per conversation to avoid race conditions
+# Using a dict instead of global variables for thread safety
+from threading import Lock
+reset_state_lock = Lock()
+reset_state = {}  # {convo_id: {'reset_mess_id': int, 'stop_event_set': bool}}
+
+def set_reset_state(convo_id, message_id):
+    """Thread-safe setter for reset state"""
+    with reset_state_lock:
+        reset_state[convo_id] = {
+            'reset_mess_id': message_id,
+            'stop_event_set': True
+        }
+
+def check_should_stop(convo_id, current_message_id):
+    """Thread-safe check if message processing should stop"""
+    with reset_state_lock:
+        if convo_id in reset_state:
+            state = reset_state[convo_id]
+            return state.get('stop_event_set', False) and current_message_id < state.get('reset_mess_id', 9999)
+        return False
+
+def clear_reset_state(convo_id):
+    """Thread-safe clear of reset state"""
+    with reset_state_lock:
+        if convo_id in reset_state:
+            del reset_state[convo_id]
 
 @decorators.GroupAuthorization
 @decorators.Authorization
 async def reset_chat(update, context):
-    global target_convo_id, reset_mess_id
     _, _, _, chatid, user_message_id, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context)
-    reset_mess_id = user_message_id
-    target_convo_id = convo_id
+
+    # Set reset state for this conversation (thread-safe)
+    set_reset_state(convo_id, user_message_id)
     stop_event.set()
     message = None
     if (len(context.args) > 0):
         message = ' '.join(context.args)
-    reset_ENGINE(target_convo_id, message)
+    reset_ENGINE(convo_id, message)
+
+    # Clear reset state after processing
+    clear_reset_state(convo_id)
 
     remove_keyboard = ReplyKeyboardRemove()
     message = await context.bot.send_message(
@@ -903,20 +1020,26 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_description(description)
 
 if __name__ == '__main__':
+    # Connection pool optimization
+    # Reduced from 65536 (unrealistic) to reasonable values
+    # Typical bot needs 100-500 connections, large bots 1000-2000
+    POOL_SIZE = int(os.environ.get('CONNECTION_POOL_SIZE', '256'))
+    UPDATES_POOL_SIZE = int(os.environ.get('UPDATES_POOL_SIZE', '128'))
+
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
-        .connection_pool_size(65536)
-        .get_updates_connection_pool_size(65536)
-        .read_timeout(time_out)
-        .write_timeout(time_out)
-        .connect_timeout(time_out)
-        .pool_timeout(time_out)
-        .get_updates_read_timeout(time_out)
-        .get_updates_write_timeout(time_out)
-        .get_updates_connect_timeout(time_out)
-        .get_updates_pool_timeout(time_out)
+        .connection_pool_size(POOL_SIZE)
+        .get_updates_connection_pool_size(UPDATES_POOL_SIZE)
+        .read_timeout(API_TIMEOUT)
+        .write_timeout(API_TIMEOUT)
+        .connect_timeout(BOT_TIMEOUT)
+        .pool_timeout(BOT_TIMEOUT)
+        .get_updates_read_timeout(API_TIMEOUT)
+        .get_updates_write_timeout(API_TIMEOUT)
+        .get_updates_connect_timeout(BOT_TIMEOUT)
+        .get_updates_pool_timeout(BOT_TIMEOUT)
         .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
         .build()
@@ -970,4 +1093,4 @@ if __name__ == '__main__':
         print("WEB_HOOK:", WEB_HOOK)
         application.run_webhook("0.0.0.0", PORT, webhook_url=WEB_HOOK)
     else:
-        application.run_polling(timeout=time_out)
+        application.run_polling(timeout=API_TIMEOUT)

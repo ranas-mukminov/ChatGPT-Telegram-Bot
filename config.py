@@ -77,9 +77,108 @@ systemprompt = os.environ.get('SYSTEMPROMPT', prompt.system_prompt.format(LANGUA
 import json
 import tomllib
 import requests
+import re
+import base64
 from contextlib import contextmanager
 
 CONFIG_DIR = os.environ.get('CONFIG_DIR', 'user_configs')
+
+# Encryption setup for API keys
+ENCRYPTION_KEY = os.environ.get('ENCRYPTION_KEY', None)
+_cipher = None
+
+def get_cipher():
+    """
+    Get or create Fernet cipher for encryption/decryption.
+    Returns None if ENCRYPTION_KEY is not set (encryption disabled).
+    """
+    global _cipher
+    if ENCRYPTION_KEY is None:
+        return None
+
+    if _cipher is None:
+        try:
+            from cryptography.fernet import Fernet
+            # Validate and create cipher
+            key_bytes = ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY
+            _cipher = Fernet(key_bytes)
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to initialize encryption: {e}")
+            logging.warning("API keys will be stored unencrypted. Set a valid ENCRYPTION_KEY to enable encryption.")
+            return None
+
+    return _cipher
+
+def encrypt_value(value):
+    """
+    Encrypt a sensitive value (like API key).
+    Returns encrypted value if encryption is enabled, otherwise returns original value.
+    """
+    if not value or not isinstance(value, str):
+        return value
+
+    cipher = get_cipher()
+    if cipher is None:
+        # Encryption not enabled, return as-is
+        return value
+
+    try:
+        encrypted_bytes = cipher.encrypt(value.encode())
+        # Prefix with marker to identify encrypted values
+        return f"ENC:{base64.b64encode(encrypted_bytes).decode()}"
+    except Exception as e:
+        import logging
+        logging.error(f"Encryption failed: {e}")
+        return value
+
+def decrypt_value(value):
+    """
+    Decrypt a sensitive value.
+    Returns decrypted value if it's encrypted, otherwise returns original value.
+    """
+    if not value or not isinstance(value, str):
+        return value
+
+    # Check if value is encrypted (has our marker)
+    if not value.startswith("ENC:"):
+        return value
+
+    cipher = get_cipher()
+    if cipher is None:
+        import logging
+        logging.warning("Cannot decrypt value: encryption not configured")
+        return value
+
+    try:
+        encrypted_data = value[4:]  # Remove "ENC:" prefix
+        encrypted_bytes = base64.b64decode(encrypted_data)
+        decrypted_bytes = cipher.decrypt(encrypted_bytes)
+        return decrypted_bytes.decode()
+    except Exception as e:
+        import logging
+        logging.error(f"Decryption failed: {e}")
+        return value
+
+def validate_user_id(user_id):
+    """
+    Validate user_id to prevent path traversal attacks.
+    Only alphanumeric characters, hyphens, and underscores are allowed.
+    """
+    if not user_id:
+        raise ValueError("user_id cannot be empty")
+
+    user_id_str = str(user_id)
+
+    # Allow alphanumeric, hyphens, and underscores only
+    if not re.match(r'^[a-zA-Z0-9_-]+$', user_id_str):
+        raise ValueError(f"Invalid user_id: {user_id_str}. Only alphanumeric characters, hyphens, and underscores are allowed.")
+
+    # Prevent excessively long user_ids
+    if len(user_id_str) > 100:
+        raise ValueError(f"user_id too long: {len(user_id_str)} characters (max 100)")
+
+    return user_id_str
 
 @contextmanager
 def file_lock(filename):
@@ -93,8 +192,9 @@ def file_lock(filename):
                 try:
                     f.seek(0)
                     msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-                except:
-                    pass  # 如果解锁失败，我们也不能做太多
+                except Exception:
+                    # If unlocking fails, there's not much we can do
+                    pass
     else:  # Unix-like系统
         import fcntl
         with open(filename, 'a+') as f:
@@ -105,17 +205,32 @@ def file_lock(filename):
                 fcntl.flock(f, fcntl.LOCK_UN)
 
 def save_user_config(user_id, config):
+    # Validate user_id to prevent path traversal
+    validated_user_id = validate_user_id(user_id)
+
     if not os.path.exists(CONFIG_DIR):
         os.makedirs(CONFIG_DIR)
 
-    filename = os.path.join(CONFIG_DIR, f'{user_id}.json')
+    filename = os.path.join(CONFIG_DIR, f'{validated_user_id}.json')
+
+    # Create a copy to avoid modifying the original
+    config_to_save = config.copy()
+
+    # Encrypt sensitive fields
+    sensitive_fields = ['api_key', 'API_KEY', 'GOOGLE_API_KEY']
+    for field in sensitive_fields:
+        if field in config_to_save and config_to_save[field]:
+            config_to_save[field] = encrypt_value(config_to_save[field])
 
     with file_lock(filename):
         with open(filename, 'w') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+            json.dump(config_to_save, f, indent=2, ensure_ascii=False)
 
 def load_user_config(user_id):
-    filename = os.path.join(CONFIG_DIR, f'{user_id}.json')
+    # Validate user_id to prevent path traversal
+    validated_user_id = validate_user_id(user_id)
+
+    filename = os.path.join(CONFIG_DIR, f'{validated_user_id}.json')
 
     if not os.path.exists(filename):
         return {}
@@ -126,7 +241,15 @@ def load_user_config(user_id):
             if not content.strip():
                 return {}
             else:
-                return json.loads(content)
+                config = json.loads(content)
+
+                # Decrypt sensitive fields
+                sensitive_fields = ['api_key', 'API_KEY', 'GOOGLE_API_KEY']
+                for field in sensitive_fields:
+                    if field in config and config[field]:
+                        config[field] = decrypt_value(config[field])
+
+                return config
 
 def update_user_config(user_id, key, value):
     config = load_user_config(user_id)
