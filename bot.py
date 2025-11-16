@@ -86,10 +86,84 @@ update_logger.addFilter(my_filter)
 update_logger = logging.getLogger("root")
 update_logger.addFilter(my_filter)
 
-# 定义一个缓存来存储消息
+# Message cache with automatic cleanup to prevent memory leaks
 from collections import defaultdict
-message_cache = defaultdict(lambda: [])
-time_stamps = defaultdict(lambda: [])
+from time import time as current_time
+
+# Configuration for cache cleanup
+CACHE_MAX_SIZE = 1000  # Maximum number of conversations to cache
+CACHE_TTL_SECONDS = 300  # Time-to-live: 5 minutes
+
+class MessageCache:
+    """
+    Thread-safe message cache with automatic cleanup to prevent memory leaks.
+    Implements size-based and time-based eviction.
+    """
+    def __init__(self, max_size=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS):
+        self.messages = defaultdict(lambda: [])
+        self.timestamps = defaultdict(lambda: [])
+        self.last_access = {}  # Track last access time for each conversation
+        self.max_size = max_size
+        self.ttl = ttl
+
+    def add_message(self, convo_id, message):
+        """Add a message to the cache and update access time."""
+        self.messages[convo_id].append(message)
+        self.timestamps[convo_id].append(current_time())
+        self.last_access[convo_id] = current_time()
+        self._cleanup_if_needed()
+
+    def get_messages(self, convo_id):
+        """Get all messages for a conversation."""
+        self.last_access[convo_id] = current_time()
+        return self.messages[convo_id]
+
+    def get_timestamps(self, convo_id):
+        """Get all timestamps for a conversation."""
+        return self.timestamps[convo_id]
+
+    def clear_conversation(self, convo_id):
+        """Clear cache for a specific conversation."""
+        if convo_id in self.messages:
+            del self.messages[convo_id]
+        if convo_id in self.timestamps:
+            del self.timestamps[convo_id]
+        if convo_id in self.last_access:
+            del self.last_access[convo_id]
+
+    def _cleanup_if_needed(self):
+        """Clean up old or excess entries to prevent memory leaks."""
+        current = current_time()
+
+        # Remove entries older than TTL
+        expired = [
+            convo_id for convo_id, last_time in self.last_access.items()
+            if current - last_time > self.ttl
+        ]
+        for convo_id in expired:
+            self.clear_conversation(convo_id)
+
+        # If still too many entries, remove least recently used
+        if len(self.messages) > self.max_size:
+            # Sort by last access time and remove oldest
+            sorted_convos = sorted(
+                self.last_access.items(),
+                key=lambda x: x[1]
+            )
+            num_to_remove = len(self.messages) - self.max_size
+            for convo_id, _ in sorted_convos[:num_to_remove]:
+                self.clear_conversation(convo_id)
+
+    def __len__(self):
+        """Return the number of cached conversations."""
+        return len(self.messages)
+
+# Global message cache instance
+message_cache_instance = MessageCache()
+
+# Keep backward compatibility with old API
+message_cache = message_cache_instance.messages
+time_stamps = message_cache_instance.timestamps
 
 @decorators.PrintMessage
 @decorators.GroupAuthorization
