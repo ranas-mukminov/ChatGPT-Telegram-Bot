@@ -61,7 +61,12 @@ import asyncio
 lock = asyncio.Lock()
 event = asyncio.Event()
 stop_event = asyncio.Event()
-time_out = 600
+
+# Timeout configuration - reduced from 600s (10 min) to reasonable values
+# API calls: 60s, bot operations: 30s
+API_TIMEOUT = 60  # Timeout for API calls (OpenAI, etc.)
+BOT_TIMEOUT = 30  # Timeout for bot operations (send message, etc.)
+time_out = BOT_TIMEOUT  # Keep for backward compatibility
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger()
@@ -205,7 +210,7 @@ async def command_bot(update, context, title="", has_command=True):
 
             bot_info_username = None
             try:
-                bot_info = await context.bot.get_me(read_timeout=time_out, write_timeout=time_out, connect_timeout=time_out, pool_timeout=time_out)
+                bot_info = await context.bot.get_me(read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT)
                 bot_info_username = bot_info.username
             except Exception as e:
                 logger.warning(f"Failed to get bot info: {e}")
@@ -322,7 +327,8 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
     result = ""
     tmpresult = ""
     modifytime = 0
-    time_out = 600
+    # Use API_TIMEOUT for long-running AI requests
+    request_timeout = API_TIMEOUT
     image_has_send = 0
     model_name = engine
     language = Users.get_config(convo_id, "language")
@@ -463,10 +469,10 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                             text=escape(send_split_message, italic=False),
                             parse_mode='MarkdownV2',
                             disable_web_page_preview=True,
-                            read_timeout=time_out,
-                            write_timeout=time_out,
-                            pool_timeout=time_out,
-                            connect_timeout=time_out
+                            read_timeout=BOT_TIMEOUT,
+                            write_timeout=BOT_TIMEOUT,
+                            pool_timeout=BOT_TIMEOUT,
+                            connect_timeout=BOT_TIMEOUT
                         )
                         lastresult = escape(send_split_message, italic=False)
                     except Exception as e:
@@ -476,10 +482,10 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                                 message_id=answer_messageid,
                                 text=send_split_message,
                                 disable_web_page_preview=True,
-                                read_timeout=time_out,
-                                write_timeout=time_out,
-                                pool_timeout=time_out,
-                                connect_timeout=time_out
+                                read_timeout=BOT_TIMEOUT,
+                                write_timeout=BOT_TIMEOUT,
+                                pool_timeout=BOT_TIMEOUT,
+                                connect_timeout=BOT_TIMEOUT
                             )
                             print("error:", send_split_message)
                         else:
@@ -495,7 +501,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
             now_result = escape(tmpresult, italic=False)
             if now_result and (modifytime % Frequency_Modification == 0 and lastresult != now_result) or "message_search_stage_" in data:
                 try:
-                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT)
                     lastresult = now_result
                 except Exception as e:
                     # print('\033[31m')
@@ -517,7 +523,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
         if api_key:
             robot.reset(convo_id=convo_id, system_prompt=systemprompt)
         if "parse entities" in str(e):
-            await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+            await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT)
         else:
             tmpresult = f"{tmpresult}\n\n`{e}`"
     print(tmpresult)
@@ -553,10 +559,10 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
             print(now_result)
         elif now_result:
             try:
-                await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+                await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=now_result, parse_mode='MarkdownV2', disable_web_page_preview=True, read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT)
             except Exception as e:
                 if "parse entities" in str(e):
-                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=BOT_TIMEOUT, write_timeout=BOT_TIMEOUT, pool_timeout=BOT_TIMEOUT, connect_timeout=BOT_TIMEOUT)
 
     if Users.get_config(convo_id, "FOLLOW_UP") and tmpresult.strip():
         if title != "":
@@ -1014,20 +1020,26 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_description(description)
 
 if __name__ == '__main__':
+    # Connection pool optimization
+    # Reduced from 65536 (unrealistic) to reasonable values
+    # Typical bot needs 100-500 connections, large bots 1000-2000
+    POOL_SIZE = int(os.environ.get('CONNECTION_POOL_SIZE', '256'))
+    UPDATES_POOL_SIZE = int(os.environ.get('UPDATES_POOL_SIZE', '128'))
+
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
-        .connection_pool_size(65536)
-        .get_updates_connection_pool_size(65536)
-        .read_timeout(time_out)
-        .write_timeout(time_out)
-        .connect_timeout(time_out)
-        .pool_timeout(time_out)
-        .get_updates_read_timeout(time_out)
-        .get_updates_write_timeout(time_out)
-        .get_updates_connect_timeout(time_out)
-        .get_updates_pool_timeout(time_out)
+        .connection_pool_size(POOL_SIZE)
+        .get_updates_connection_pool_size(UPDATES_POOL_SIZE)
+        .read_timeout(API_TIMEOUT)
+        .write_timeout(API_TIMEOUT)
+        .connect_timeout(BOT_TIMEOUT)
+        .pool_timeout(BOT_TIMEOUT)
+        .get_updates_read_timeout(API_TIMEOUT)
+        .get_updates_write_timeout(API_TIMEOUT)
+        .get_updates_connect_timeout(BOT_TIMEOUT)
+        .get_updates_pool_timeout(BOT_TIMEOUT)
         .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
         .build()
@@ -1081,4 +1093,4 @@ if __name__ == '__main__':
         print("WEB_HOOK:", WEB_HOOK)
         application.run_webhook("0.0.0.0", PORT, webhook_url=WEB_HOOK)
     else:
-        application.run_polling(timeout=time_out)
+        application.run_polling(timeout=API_TIMEOUT)
