@@ -349,7 +349,8 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
         # print("text", text)
         async for data in robot.ask_stream_async(text, convo_id=convo_id, pass_history=pass_history, model=model_name, language=language, api_url=api_url, api_key=api_key, system_prompt=system_prompt, plugins=plugins):
         # for data in robot.ask_stream(text, convo_id=convo_id, pass_history=pass_history, model=model_name):
-            if stop_event.is_set() and convo_id == target_convo_id and answer_messageid < reset_mess_id:
+            # Check if this conversation should stop (thread-safe)
+            if stop_event.is_set() and check_should_stop(convo_id, answer_messageid):
                 return
             if "message_search_stage_" not in data:
                 result = result + data
@@ -841,22 +842,49 @@ def remove_job_if_exists(name: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
         job.schedule_removal()
     return True
 
-# 定义一个全局变量来存储 chatid
-target_convo_id = None
-reset_mess_id = 9999
+# Store reset state per conversation to avoid race conditions
+# Using a dict instead of global variables for thread safety
+from threading import Lock
+reset_state_lock = Lock()
+reset_state = {}  # {convo_id: {'reset_mess_id': int, 'stop_event_set': bool}}
+
+def set_reset_state(convo_id, message_id):
+    """Thread-safe setter for reset state"""
+    with reset_state_lock:
+        reset_state[convo_id] = {
+            'reset_mess_id': message_id,
+            'stop_event_set': True
+        }
+
+def check_should_stop(convo_id, current_message_id):
+    """Thread-safe check if message processing should stop"""
+    with reset_state_lock:
+        if convo_id in reset_state:
+            state = reset_state[convo_id]
+            return state.get('stop_event_set', False) and current_message_id < state.get('reset_mess_id', 9999)
+        return False
+
+def clear_reset_state(convo_id):
+    """Thread-safe clear of reset state"""
+    with reset_state_lock:
+        if convo_id in reset_state:
+            del reset_state[convo_id]
 
 @decorators.GroupAuthorization
 @decorators.Authorization
 async def reset_chat(update, context):
-    global target_convo_id, reset_mess_id
     _, _, _, chatid, user_message_id, _, _, message_thread_id, convo_id, _, _, _ = await GetMesageInfo(update, context)
-    reset_mess_id = user_message_id
-    target_convo_id = convo_id
+
+    # Set reset state for this conversation (thread-safe)
+    set_reset_state(convo_id, user_message_id)
     stop_event.set()
     message = None
     if (len(context.args) > 0):
         message = ' '.join(context.args)
-    reset_ENGINE(target_convo_id, message)
+    reset_ENGINE(convo_id, message)
+
+    # Clear reset state after processing
+    clear_reset_state(convo_id)
 
     remove_keyboard = ReplyKeyboardRemove()
     message = await context.bot.send_message(
