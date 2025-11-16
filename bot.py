@@ -6,6 +6,18 @@ import logging
 import traceback
 import utils.decorators as decorators
 
+
+def redact_sensitive_info(msg, api_key=None, systemprompt=None):
+    """Redact sensitive info such as API keys and system prompts from strings."""
+    redacted = str(msg)
+    if api_key:
+        # Redact any occurrence of api_key
+        redacted = redacted.replace(str(api_key), "***REDACTED_API_KEY***")
+    if systemprompt:
+        # Redact systemprompt if it's deemed sensitive
+        redacted = redacted.replace(str(systemprompt), "***REDACTED_SYSTEMPROMPT***")
+    return redacted
+
 from md2tgmd.src.md2tgmd import escape, split_code, replace_all
 from aient.aient.utils.scripts import Document_extract
 from aient.aient.core.utils import get_engine, get_image_message, get_text_message
@@ -414,7 +426,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
     except Exception as e:
         print('\033[31m')
         traceback.print_exc()
-        print(tmpresult)
+        print(redact_sensitive_info(tmpresult, Users.get_config(convo_id, "api_key"), Users.get_config(convo_id, "systemprompt")))
         print('\033[0m')
         api_key = Users.get_config(convo_id, "api_key")
         systemprompt = Users.get_config(convo_id, "systemprompt")
