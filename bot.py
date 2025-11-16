@@ -208,8 +208,12 @@ async def command_bot(update, context, title="", has_command=True):
                 bot_info = await context.bot.get_me(read_timeout=time_out, write_timeout=time_out, connect_timeout=time_out, pool_timeout=time_out)
                 bot_info_username = bot_info.username
             except Exception as e:
-                print("error:", e)
-                bot_info_username = update_message.reply_to_message.from_user.username
+                logger.warning(f"Failed to get bot info: {e}")
+                # Safely get username, checking for None
+                if update_message.reply_to_message and update_message.reply_to_message.from_user:
+                    bot_info_username = update_message.reply_to_message.from_user.username
+                else:
+                    bot_info_username = None
 
             if update_message.reply_to_message \
             and update_message.from_user.is_bot == False \
@@ -499,10 +503,15 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                     # print('\033[0m')
                     continue
     except Exception as e:
-        print('\033[31m')
-        traceback.print_exc()
-        print(redact_sensitive_info(tmpresult, Users.get_config(convo_id, "api_key"), Users.get_config(convo_id, "systemprompt")))
-        print('\033[0m')
+        # Log error properly without exposing sensitive data to stdout
+        error_msg = str(e)
+        logger.error(
+            f"Error in getChatGPT for conversation {convo_id}: {error_msg}",
+            exc_info=False  # Don't log full traceback to avoid sensitive data leakage
+        )
+        # Only log detailed traceback to file if needed for debugging
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Full traceback:", exc_info=True)
         api_key = Users.get_config(convo_id, "api_key")
         systemprompt = Users.get_config(convo_id, "systemprompt")
         if api_key:
