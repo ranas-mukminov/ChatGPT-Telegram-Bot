@@ -78,9 +78,87 @@ import json
 import tomllib
 import requests
 import re
+import base64
 from contextlib import contextmanager
 
 CONFIG_DIR = os.environ.get('CONFIG_DIR', 'user_configs')
+
+# Encryption setup for API keys
+ENCRYPTION_KEY = os.environ.get('ENCRYPTION_KEY', None)
+_cipher = None
+
+def get_cipher():
+    """
+    Get or create Fernet cipher for encryption/decryption.
+    Returns None if ENCRYPTION_KEY is not set (encryption disabled).
+    """
+    global _cipher
+    if ENCRYPTION_KEY is None:
+        return None
+
+    if _cipher is None:
+        try:
+            from cryptography.fernet import Fernet
+            # Validate and create cipher
+            key_bytes = ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY
+            _cipher = Fernet(key_bytes)
+        except Exception as e:
+            import logging
+            logging.error(f"Failed to initialize encryption: {e}")
+            logging.warning("API keys will be stored unencrypted. Set a valid ENCRYPTION_KEY to enable encryption.")
+            return None
+
+    return _cipher
+
+def encrypt_value(value):
+    """
+    Encrypt a sensitive value (like API key).
+    Returns encrypted value if encryption is enabled, otherwise returns original value.
+    """
+    if not value or not isinstance(value, str):
+        return value
+
+    cipher = get_cipher()
+    if cipher is None:
+        # Encryption not enabled, return as-is
+        return value
+
+    try:
+        encrypted_bytes = cipher.encrypt(value.encode())
+        # Prefix with marker to identify encrypted values
+        return f"ENC:{base64.b64encode(encrypted_bytes).decode()}"
+    except Exception as e:
+        import logging
+        logging.error(f"Encryption failed: {e}")
+        return value
+
+def decrypt_value(value):
+    """
+    Decrypt a sensitive value.
+    Returns decrypted value if it's encrypted, otherwise returns original value.
+    """
+    if not value or not isinstance(value, str):
+        return value
+
+    # Check if value is encrypted (has our marker)
+    if not value.startswith("ENC:"):
+        return value
+
+    cipher = get_cipher()
+    if cipher is None:
+        import logging
+        logging.warning("Cannot decrypt value: encryption not configured")
+        return value
+
+    try:
+        encrypted_data = value[4:]  # Remove "ENC:" prefix
+        encrypted_bytes = base64.b64decode(encrypted_data)
+        decrypted_bytes = cipher.decrypt(encrypted_bytes)
+        return decrypted_bytes.decode()
+    except Exception as e:
+        import logging
+        logging.error(f"Decryption failed: {e}")
+        return value
 
 def validate_user_id(user_id):
     """
@@ -135,9 +213,18 @@ def save_user_config(user_id, config):
 
     filename = os.path.join(CONFIG_DIR, f'{validated_user_id}.json')
 
+    # Create a copy to avoid modifying the original
+    config_to_save = config.copy()
+
+    # Encrypt sensitive fields
+    sensitive_fields = ['api_key', 'API_KEY', 'GOOGLE_API_KEY']
+    for field in sensitive_fields:
+        if field in config_to_save and config_to_save[field]:
+            config_to_save[field] = encrypt_value(config_to_save[field])
+
     with file_lock(filename):
         with open(filename, 'w') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+            json.dump(config_to_save, f, indent=2, ensure_ascii=False)
 
 def load_user_config(user_id):
     # Validate user_id to prevent path traversal
@@ -154,7 +241,15 @@ def load_user_config(user_id):
             if not content.strip():
                 return {}
             else:
-                return json.loads(content)
+                config = json.loads(content)
+
+                # Decrypt sensitive fields
+                sensitive_fields = ['api_key', 'API_KEY', 'GOOGLE_API_KEY']
+                for field in sensitive_fields:
+                    if field in config and config[field]:
+                        config[field] = decrypt_value(config[field])
+
+                return config
 
 def update_user_config(user_id, key, value):
     config = load_user_config(user_id)
