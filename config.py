@@ -77,9 +77,30 @@ systemprompt = os.environ.get('SYSTEMPROMPT', prompt.system_prompt.format(LANGUA
 import json
 import tomllib
 import requests
+import re
 from contextlib import contextmanager
 
 CONFIG_DIR = os.environ.get('CONFIG_DIR', 'user_configs')
+
+def validate_user_id(user_id):
+    """
+    Validate user_id to prevent path traversal attacks.
+    Only alphanumeric characters, hyphens, and underscores are allowed.
+    """
+    if not user_id:
+        raise ValueError("user_id cannot be empty")
+
+    user_id_str = str(user_id)
+
+    # Allow alphanumeric, hyphens, and underscores only
+    if not re.match(r'^[a-zA-Z0-9_-]+$', user_id_str):
+        raise ValueError(f"Invalid user_id: {user_id_str}. Only alphanumeric characters, hyphens, and underscores are allowed.")
+
+    # Prevent excessively long user_ids
+    if len(user_id_str) > 100:
+        raise ValueError(f"user_id too long: {len(user_id_str)} characters (max 100)")
+
+    return user_id_str
 
 @contextmanager
 def file_lock(filename):
@@ -93,8 +114,9 @@ def file_lock(filename):
                 try:
                     f.seek(0)
                     msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-                except:
-                    pass  # 如果解锁失败，我们也不能做太多
+                except Exception:
+                    # If unlocking fails, there's not much we can do
+                    pass
     else:  # Unix-like系统
         import fcntl
         with open(filename, 'a+') as f:
@@ -105,17 +127,23 @@ def file_lock(filename):
                 fcntl.flock(f, fcntl.LOCK_UN)
 
 def save_user_config(user_id, config):
+    # Validate user_id to prevent path traversal
+    validated_user_id = validate_user_id(user_id)
+
     if not os.path.exists(CONFIG_DIR):
         os.makedirs(CONFIG_DIR)
 
-    filename = os.path.join(CONFIG_DIR, f'{user_id}.json')
+    filename = os.path.join(CONFIG_DIR, f'{validated_user_id}.json')
 
     with file_lock(filename):
         with open(filename, 'w') as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
 def load_user_config(user_id):
-    filename = os.path.join(CONFIG_DIR, f'{user_id}.json')
+    # Validate user_id to prevent path traversal
+    validated_user_id = validate_user_id(user_id)
+
+    filename = os.path.join(CONFIG_DIR, f'{validated_user_id}.json')
 
     if not os.path.exists(filename):
         return {}
