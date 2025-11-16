@@ -68,7 +68,7 @@ logger = logging.getLogger()
 
 logging.getLogger("httpx").setLevel(logging.CRITICAL)
 logging.getLogger("chromadb.telemetry.posthog").setLevel(logging.WARNING)
-logging.getLogger('googleapicliet.discovery_cache').setLevel(logging.ERROR)
+logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
 
 class SpecificStringFilter(logging.Filter):
     def __init__(self, specific_string):
